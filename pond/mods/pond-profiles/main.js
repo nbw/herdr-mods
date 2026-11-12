@@ -108,9 +108,7 @@ export default class Claude extends View {
         else if (c === "updates") this.checkUpdates(cx);
         else if (c === "setup") this.openSetup(cx);
         else if (c === "add-profile") openProfileForm(this, cx);
-        else if (c === "finish" && this.setupShown && this.st?.setup?.basics) {
-          this.act("setup-finish", "…", ["setup", "done"], cx, { then: (_r, cx) => { this.setupShown = false; this.form = null; this.startPanel(cx); } });
-        }
+        else if (c === "finish") this.closeSetup(cx);
         cx.notify();
       }
     });
@@ -152,6 +150,11 @@ export default class Claude extends View {
     this.loadUsage(cx);
     this.loadRouter(cx);
     if (!this.remote || Date.now() - this.remote.at > UPDATE_EVERY) this.checkUpdates(cx);
+  }
+
+  closeSetup(cx) {
+    if (!this.setupShown || !this.st?.setup?.basics) return;
+    this.act("setup-finish", "…", ["setup", "done"], cx, { then: (_r, cx) => { this.setupShown = false; this.form = null; this.startPanel(cx); } });
   }
 
   openSetup(cx) {
@@ -844,7 +847,8 @@ export default class Claude extends View {
         .child(iconButton("refresh", "mods/servers/restart.svg", "Refresh (r)", cx => {
           this.refresh(cx);
           if (this.setupShown) loadDoctor(this, cx); else { this.loadRouter(cx); this.loadUsage(cx); }
-        })))
+        }))
+        .when(this.setupShown && Boolean(st?.setup?.basics), el => el.child(iconButton("setup-close", `${CHROME}/x.svg`, "Back to the panel", cx => this.closeSetup(cx)))))
       .child(v_flex().id("claude-body").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.scroll).p(8).gap(8)
         .when(!st, el => el.child(div().p(16).text_size(12.5).text_color(this.err ? t.ansi1 : t.dim).child(this.err ?? "Loading…")))
         .when(Boolean(st) && this.setupShown, el => el.child(setupView(this, t)))

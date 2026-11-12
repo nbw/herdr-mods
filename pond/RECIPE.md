@@ -14,7 +14,7 @@ third-party gitview instead of Herdr's stock panel.
 (and the `mod` names in the layout), run `herdr-app check ~/.config/herdr-app/mods/<name>` on
 each, install and patch gitview (below), then `herdr-app do layout.switch --name pond`.
 
-**Version:** 1.2.0 (see Changes at the end; also `"version"` in `layouts/pond.json`, and each mod's own in its `mod.json`).
+**Version:** 1.3.0 (see Changes at the end; also `"version"` in `layouts/pond.json`, and each mod's own in its `mod.json`).
 
 **Update:** tell your Herdr agent "update my herdr mods" (or "update pond mods"). It follows `UPDATE.md`, installed in the mod folder, which checks this repo's `versions.json` and offers every newer version of the mods and layouts you have from here, with a backup of each. By hand: replace `layouts/pond.json` and each folder in `mods/` with this folder's copies (asking an agent to *install* again adds second copies instead). Sizes and panels you clicked are kept (Herdr keeps them in `layouts/.state/`), and so are the mods' settings and data; edits you made inside `pond.json` or the mod folders are not. Reapply the gitview patch if gitview updated too.
 
@@ -148,6 +148,10 @@ gitview needs no other change.
 - `layout.switch` (`ctrl-shift-l` by default) cycles back to the previous layout.
 
 ## Changes
+
+### 1.3.0 (2026-11-12)
+
+- pond-profiles 1.2.0 (✕ in setup goes back to the panel). Mods at: pond-agents 1.1.1, pond-tabs 1.1.0, servers 1.0.1, pond-profiles 1.2.0; others 1.0.0.
 
 ### 1.2.0 (2026-11-12)
 

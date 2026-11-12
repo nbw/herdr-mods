@@ -37,7 +37,7 @@ https://github.com/SimonBystromTableCheck/herdr-mods/tree/main/pond-profiles". N
 4. Open the panel once: the setup wizard installs cvm, puts it on PATH, installs Claude and cvp,
    and offers gateway profiles and agent-router.
 
-**Version:** 1.1.0 (see Changes at the end; also `"version"` in `mod.json`).
+**Version:** 1.2.0 (see Changes at the end; also `"version"` in `mod.json`).
 
 **Update:** tell your Herdr agent "update my herdr mods" (or "update pond mods"). It follows `UPDATE.md`, installed in the mod folder, which checks this repo's `versions.json` and offers every newer version of the mods and layouts you have from here, with a backup of each. By hand: replace `mods/pond-profiles/` with this folder's copy (asking an agent to *install* it again adds a second copy instead). Your settings and data live outside the mod folder (`~/.cvm/herdr/`) and are kept.
 
@@ -161,6 +161,10 @@ function; the cvp step warns when new terminals can't find `hc`.
 - An agent-router role's model and effort dropdowns save and show the new value after reload.
 
 ## Changes
+
+### 1.2.0 (2026-11-12)
+
+- Setup has an ✕ beside refresh in the header that goes back to the panel (same as "Back to the panel"), shown once the first steps are done.
 
 ### 1.1.0 (2026-11-12)
 

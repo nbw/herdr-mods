@@ -58,14 +58,14 @@
       "path": "pond-tabs/mods/pond-tabs"
     },
     "pond-profiles": {
-      "version": "1.1.0",
+      "version": "1.2.0",
       "item": "pond-profiles",
       "path": "pond-profiles/mods/pond-profiles"
     }
   },
   "layouts": {
     "pond": {
-      "version": "1.2.0",
+      "version": "1.3.0",
       "item": "pond",
       "path": "pond/layouts/pond.json",
       "mods": [
