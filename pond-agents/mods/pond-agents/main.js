@@ -62,9 +62,11 @@ const SORTS = [
   { id: "priority", label: "Priority", icon: "clock" },
   { id: "grouped", label: "Grouped by space", icon: "layers" },
 ];
-const sortOf = () => SORTS.find((s) => s.id === shared("agents.sort")) ?? SORTS[0];
+const sortOf = () => SORTS.find((s) => s.id === shared("agents.sort")) ?? SORTS[1];
 const SECTION = { 4: "Needs you", 3: "Done", 2: "Working", 1: "Idle" };
 const SECTION_STATUS = { 4: "blocked", 3: "done", 2: "working" };
+// The spaces list's marks (mods/spaces): a space's color in shared("space.colors") is one of these or a hex.
+const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
 
 function duration(ms) {
   const m = Math.floor(ms / 60000);
@@ -117,7 +119,7 @@ export default class Agents extends View {
     });
     accounts(cx);
     cx.timer.every(5000, accounts);
-    this.folded = new Set();
+    this.folded = new Set(JSON.parse(localStorage.getItem("folded") ?? "[]"));
     // Each agent's last state and when it changed (ms), kept across restarts.
     this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");
     this.pendingPins = JSON.parse(localStorage.getItem("pins") ?? "[]");
@@ -357,7 +359,7 @@ export default class Agents extends View {
     }));
 
     const row = (a, i, subs = []) => {
-      const pic = figureFor(a.space_name, a.status, 45, now - this.since(a));
+      const pic = figureFor(a.space_name, a.status, 32, now - this.since(a));
       const ctx = contextOf.get(a.address);
       const more = detail.get(a.address);
       // An agent on another machine (`vps/t7`) says which.
@@ -403,7 +405,8 @@ export default class Agents extends View {
         .id(`ag-${a.address}`)
         .pl(4)
         .pr(8)
-        .h(66)
+        .py(7)
+        .min_h(50)
         .flex_none()
         .rounded(8)
         .items_center()
@@ -426,16 +429,19 @@ export default class Agents extends View {
             this.folded.has(a.address) ? this.folded.delete(a.address) : this.folded.add(a.address);
             cx.notify();
           })).child(pic))
-        .child(v_flex().flex_1().min_w(0).gap(1)
-          .child(div().min_w(0).truncate().text_color(idle ? t.muted : t.foreground).child(name))
+        .child(v_flex().flex_1().min_w(0).gap(3)
+          .child(h_flex().min_w(0).gap(4).items_start()
+            .child(div().flex_1().min_w(0).whitespace_normal().line_height(1.25).font_medium().text_color(idle ? t.muted : t.foreground).child(name))
+            .when(this.hovered === a.address, el => el.child(pin)))
           .when(full && Boolean(more), el => el.child(div().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(more)))
-          .when(ctx?.pct != null, el => el.child(contextBar(t, ctx.pct, ctx.model, a.address, accountLabel(this.accounts, ctx.account)))))
-        .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
-        .when(subs.length > 0, el => el.child(fold(a, subs)))
-        .when(this.hovered === a.address, el => el.child(pin))
-        .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
-        .child(this.status(t, a, byPriority && !isPinned))
-        .when(Boolean(ctx?.account), el => el.child(div().absolute().right(8).bottom(7).child(accountBadge(t, accountLabel(this.accounts, ctx.account), this.accounts?.[ctx.account]?.gateway))));
+          .child(h_flex().min_w(0).gap(6).items_center().text_size(11).text_color(t.dim)
+            .child(this.status(t, a, !isPinned))
+            .when(Boolean(when), el => el.child(div().flex_none().child(duration(now - when))))
+            .when(Boolean(machine), el => el.child(div().flex_none().text_size(10).child(machine)))
+            .child(div().flex_1())
+            .when(subs.length > 0, el => el.child(fold(a, subs)))
+            .when(Boolean(ctx?.account), el => el.child(accountBadge(t, accountLabel(this.accounts, ctx.account), this.accounts?.[ctx.account]?.gateway))))
+          .when(ctx?.pct != null, el => el.child(contextBar(t, ctx.pct, ctx.model, a.address, accountLabel(this.accounts, ctx.account)))));
     };
 
     // Groups in list order: spaces (grouped) or priority sections. Agents of a
@@ -445,8 +451,10 @@ export default class Agents extends View {
       const r = rankOf(a) || RANK.idle;
       const id = byPriority ? `sec-${r}` : `sp-${a.space}`;
       if (groups.at(-1)?.id === id) groups.at(-1).members.push(a);
-      else groups.push({ id, label: byPriority ? SECTION[r] : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
+      else groups.push({ id, space: byPriority ? null : a.space, label: byPriority ? SECTION[r] : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
     }
+    const colors = shared("space.colors") ?? {};
+    const fillOf = (space) => { const c = colors[space] ?? "ansi6"; return c.startsWith("#") ? c : (MARK[c] ?? t[c]); };
 
     // A group's header; it folds the group. Folded, it says how many and the most urgent state.
     const header = (g) => {
@@ -466,18 +474,34 @@ export default class Agents extends View {
         .hover((s) => s.text_color(t.foreground))
         .on_click((_e, cx) => {
           open ? this.folded.add(g.id) : this.folded.delete(g.id);
+          localStorage.setItem("folded", JSON.stringify([...this.folded]));
           cx.notify();
         })
-        .child(div().truncate().text_color(t[g.status] ?? t.dim).child(g.label))
+        .when(Boolean(g.space), (el) => el.child(div().size(14).flex_none().rounded(4).bg(fillOf(g.space)).flex().items_center().justify_center()
+          .text_size(9).font_bold().text_color("#ffffff").child([...g.label][0]?.toUpperCase() ?? "?")))
+        .child(div().truncate().text_color(g.space ? t.foreground : (t[g.status] ?? t.dim)).child(g.label))
         .when(byPriority || !open, (el) => el.child(div().text_color(t.dim).child(String(g.members.length))))
         .child(div().flex_1())
         .when(!open, (el) => el
           .when(!byPriority && top && top !== "idle", (el) => el.child(this.status(t, { status: top }, true)))
           .child(svg("mods/workspace-chrome/chevron-right.svg").size(11).flex_none().text_color(t.dim)));
     };
+    // Inside a space, its agents split by state like the priority view, most urgent first.
+    const sectionHeader = (g, r, n) => h_flex().id(`${g.id}-sec-${r}`).pl(12).pr(8).h(22).flex_none().gap(6).items_center().text_size(10.5)
+      .child(div().text_color(t[SECTION_STATUS[r]] ?? t.dim).child(SECTION[r]))
+      .child(div().text_color(t.dim).child(String(n)));
+    const members = (g) => {
+      if (!g.space) return g.members.flatMap(withKids);
+      const by = new Map();
+      for (const a of g.members) { const r = rankOf(a) || RANK.idle; by.set(r, [...(by.get(r) ?? []), a]); }
+      return [...by.keys()].sort((x, y) => y - x).flatMap((r) => {
+        const ms = by.get(r).sort((x, y) => this.since(y) - this.since(x) || y.seq - x.seq);
+        return [sectionHeader(g, r, ms.length), ...ms.flatMap(withKids)];
+      });
+    };
     const rows = collapsed
       ? list.flatMap(withKids)
-      : groups.flatMap((g) => [header(g), ...(this.folded.has(g.id) ? [] : g.members.flatMap(withKids))]);
+      : groups.flatMap((g) => [header(g), ...(this.folded.has(g.id) ? [] : members(g))]);
 
     return v_flex()
       .size_full()

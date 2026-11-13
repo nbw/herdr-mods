@@ -3,11 +3,12 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Editor, EditorState, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { keybar, keysCard } from "./keybar.js";
-import { spaces, panes, focused, agents, knownAgents, exec, hc, run, theme, settings, props, appHome, watchFolder, nextCommand, readTextFile, setShared, shared } from "herdr";
+import { spaces, panes, focused, agents, knownAgents, exec, hc, run, theme, settings, props, appHome, watchFolder, nextCommand, readTextFile, writeTextFile, setShared, shared } from "herdr";
 import * as G from "./git.js";
 import { graphCell } from "./graph.js";
 import { SelfUpdate } from "./update.js";
 import { closePanel, hidePanel, revealPanel } from "./panel.js";
+import { findRepoConfig } from "./repos.js";
 
 const commitDraft = root => (shared("git.commitDrafts") ?? {})[root] ?? "";
 function setCommitDraft(root, msg) {
@@ -19,11 +20,11 @@ function setCommitDraft(root, msg) {
 const ROW = 22, LINE = 18;
 const CHROME = "mods/workspace-chrome";
 const SECTIONS = [
-  { id: "branches", key: "3", title: "Branches", cap: 5, tabs: ["Local", "Remote"] },
+  { id: "branches", key: "3", title: "Branches", cap: 5, tabs: ["PRs", "Local", "Remote"] },
+  { id: "files", key: "6", title: "Files", cap: 6 },
   { id: "commits", key: "4", title: "Commits", cap: 6, tabs: ["Branch", "All"] },
-  { id: "stash", key: "5", title: "Stash", cap: 2 },
 ];
-const LISTS = ["branches0", "branches1", "commits0", "commits1", "stash"];
+const LISTS = ["branches0", "branches1", "branches2", "files", "commits0", "commits1", "stash"];
 const PR_COLOR = { OPEN: "ansi2", MERGED: "ansi5", CLOSED: "ansi1" };
 const { q } = G;
 
@@ -40,8 +41,8 @@ function location(fixed, keep) {
 
 // lazygit spells keys "<c-p>", "<a-x>", "<space>"; keys here are "ctrl-p", "alt-x", "space".
 const lazyKey = k => k.replace(/^<c-(.+)>$/, "ctrl-$1").replace(/^<a-(.+)>$/, "alt-$1").replace(/^<(.+)>$/, "$1");
-const CONTEXTS = { global: () => true, localBranches: v => v.sec === "branches" && !v.tab.branches,
-  remoteBranches: v => v.sec === "branches" && v.tab.branches === 1, commits: v => v.sec === "commits", stash: v => v.sec === "stash" };
+const CONTEXTS = { global: () => true, localBranches: v => v.sec === "branches" && v.tab.branches === 1,
+  remoteBranches: v => v.sec === "branches" && v.tab.branches === 2, commits: v => v.sec === "commits", stash: v => v.sec === "stash" };
 
 function keyOf(e) {
   const m = e.modifiers ?? {};
@@ -60,6 +61,54 @@ function lineKind(text, style) {
   return { kind: "", text };
 }
 
+// A patch split into one card per file: a header row (path, +/-), its hunks and lines, a gap between cards.
+function fileCards(lines) {
+  const rows = [];
+  let card = null, oldNo = 0, newNo = 0;
+  const close = () => { if (card?.last) card.last.last = true; };
+  for (const raw of lines) {
+    const text = raw.replace(/\t/g, "    ");
+    const m = text.match(/^diff --git a\/(.*) b\/(.*)$/);
+    if (m) {
+      close();
+      if (rows.length) rows.push({ kind: "gap" });
+      card = { kind: "card", path: m[2], from: m[1] !== m[2] ? m[1] : null, status: null, add: 0, del: 0, last: null };
+      rows.push(card);
+      continue;
+    }
+    if (!card) continue;
+    if (/^new file/.test(text)) { card.status = "new"; continue; }
+    if (/^deleted file/.test(text)) { card.status = "deleted"; continue; }
+    if (/^(index |--- |\+\+\+ |similarity|rename |old mode|new mode|dissimilarity|copy )/.test(text)) continue;
+    const row = text.startsWith("@@") ? { kind: "hunk", text } : text.startsWith("+") ? { kind: "add", text } : text.startsWith("-") ? { kind: "del", text } : { kind: "", text };
+    const at = row.kind === "hunk" && text.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)/);
+    if (at) { oldNo = Number(at[1]); newNo = Number(at[2]); }
+    else if (row.kind === "add") row.new = newNo++;
+    else if (row.kind === "del") row.old = oldNo++;
+    else if (row.kind === "" && !text.startsWith("\\")) { row.old = oldNo++; row.new = newNo++; }
+    if (row.kind === "add") card.add++;
+    if (row.kind === "del") card.del++;
+    row.inCard = true; card.last = row;
+    rows.push(row);
+  }
+  close();
+  for (const r of rows) if (r.kind === "card" && !r.last) r.last = r;
+  return rows;
+}
+
+function commitCards(log) {
+  const rows = [];
+  for (const c of log) {
+    if (rows.length) rows.push({ kind: "gap" });
+    const card = { kind: "card", path: `${c.short}  ${c.subject}`, add: 0, del: 0 };
+    const meta = { kind: "meta", text: `${c.author} · ${c.date}`, inCard: true };
+    const body = c.body ? [{ kind: "", text: "", inCard: true }, ...c.body.split("\n").map(l => ({ kind: "", text: l.replace(/\t/g, "    "), inCard: true }))] : [];
+    rows.push(card, meta, ...body);
+    card.last = rows.at(-1); card.last.last = true;
+  }
+  return rows;
+}
+
 export default class Git extends View {
   init(_props, cx) {
     this.selfUpdate = new SelfUpdate("git", "Git panel"); this.selfUpdate.start(cx);
@@ -70,6 +119,9 @@ export default class Git extends View {
     if (this.fixed) cx.timer.after(150, () => this.handle.focus());
     this.scrolls = Object.fromEntries([...LISTS, "main"].map(k => [k, VirtualListScrollHandle.new()]));
     this.sec = "branches"; this.tab = { branches: 0, commits: 0 };
+    // Sizes dragged by hand (px): each section box's height, the sections column's width (wide), the main view's height (narrow).
+    this.sizes = JSON.parse(localStorage.getItem("sizes") ?? "{}"); this.measured = {}; this.drag = null;
+    this.collapsed = new Set(JSON.parse(localStorage.getItem("collapsed") ?? "[]"));
     this.sel = {}; this.filter = {}; this.log = []; this.seq = 0; this.copied = [];
     this.mainTop = 0; this.mainToken = 0;
     this.seqEditor = `${appHome()}/mods/git/seq-edit.pl`;
@@ -115,9 +167,76 @@ export default class Git extends View {
 
   tick(cx) {
     if (this.flashMsg && Date.now() > this.flashMsg.until) { this.flashMsg = null; cx.notify(); }
-    const k = JSON.stringify(location(this.fixed, this.loc));
+    this.loadRepoConfig(cx);
+    const k = JSON.stringify(this.where());
     if (k !== this.locKey) return this.refresh(cx, true);
     if (this.dirty || Date.now() - (this.lastHeavy ?? 0) > 30000) { const heavy = this.dirty !== "light"; this.dirty = null; this.refresh(cx, heavy); }
+  }
+
+  // `pick`: null follows the pane (but a pane in the config's own folder shows `default`),
+  // "pane" always follows the pane, else a repo name from .herdr/git.toml.
+  where() {
+    if (this.fixed) return this.fixed;
+    const auto = this.autoLoc = location(null, this.autoLoc), cfg = this.repoCfg;
+    if (!cfg || this.pick === "pane") return auto;
+    const repo = cfg.repos.find(r => r.name === this.pick)
+      ?? (auto.cwd === cfg.base ? cfg.repos.find(r => r.name === cfg.default) ?? cfg.repos[0] : null);
+    return repo ? { cwd: repo.cwd, on: auto.on, space: auto.space } : auto;
+  }
+
+  loadRepoConfig(cx) {
+    if (this.fixed || this.repoCfgLoading) return;
+    const auto = location(null, this.autoLoc);
+    if (auto.cwd === this.repoCfgFor && Date.now() - (this.repoCfgAt ?? 0) < 10000) return;
+    this.repoCfgLoading = true;
+    cx.spawn(async cx => {
+      try {
+        const cfg = await findRepoConfig(auto.cwd, auto.on);
+        if (cfg?.file !== this.repoCfg?.file) this.pick = null;
+        this.repoCfg = cfg;
+      } catch (e) { this.flash(`.herdr/git.toml: ${e.message ?? e}`, 8000); }
+      finally {
+        Object.assign(this, { repoCfgFor: auto.cwd, repoCfgAt: Date.now(), repoCfgLoading: false });
+        cx.notify();
+      }
+    });
+  }
+
+  repoBar(t) {
+    const repos = this.repoCfg?.repos ?? [], root = this.ctx?.root;
+    const current = this.pick === "pane" ? null : repos.find(r => r.cwd === root);
+    const palette = ["ansi4", "ansi2", "ansi5", "ansi6", "ansi3", "ansi1"];
+    const chip = (id, label, color, on, pick) => h_flex().id(id).flex_1().min_w(0).h(24).px(6).items_center().justify_center().rounded(6)
+      .bg(color).text_color(t.background).text_size(11.5).opacity(on ? 1 : 0.45).when(on, el => el.font_semibold())
+      .cursor_pointer().hover(s => s.opacity(on ? 1 : 0.75))
+      .on_click((_e, cx) => { this.pick = pick; this.refresh(cx, true); cx.notify(); }).child(div().truncate().child(label));
+    return h_flex().flex_none().px(12).py(6).gap(6).items_center().border_b(1).border_color(t.border)
+      .child(chip("git-repo-root", "root", t.muted, !current, "pane").flex_none().w(44))
+      .children(repos.map((r, i) => chip(`git-repo-${i}`, r.name, t[r.color] ?? t[palette[i % palette.length]], r === current, r.name)))
+      .child(h_flex().id("git-repo-add").flex_none().size(24).items_center().justify_center().rounded(6).border_1().border_color(t.border)
+        .text_color(t.muted).text_size(14).cursor_pointer().hover(s => s.bg(t.hover).text_color(t.foreground))
+        .on_click((_e, cx) => this.addRepo(cx)).child("+"));
+  }
+
+  addRepo(cx) {
+    const cfg = this.repoCfg;
+    if (!cfg) return;
+    this.ask("Add repo button", "", (input, cx) => {
+      if (!input) return;
+      const [path, name = path.replace(/\/+$/, "").split("/").pop()] = input.split(/\s+as\s+/);
+      const cwd = path.startsWith("/") ? path : `${cfg.base}/${path.replace(/^\.\//, "")}`;
+      cx.spawn(async cx => {
+        try {
+          if (!(await G.openRepo(cwd, this.loc?.on ?? null))) throw new Error(`not a git repo: ${cwd}`);
+          if (cfg.repos.some(r => r.name === name)) throw new Error(`"${name}" is already a button`);
+          const text = await readTextFile(cfg.file);
+          await writeTextFile(cfg.file, `${text.replace(/\n*$/, "\n")}\n[[repo]]\nname = "${name}"\npath = "${path}"\n`, text);
+          this.pick = name; this.repoCfgAt = 0; this.flash(`Added ${name}`);
+        } catch (e) { this.flash(`Couldn't add: ${e.message ?? e}`, 6000); }
+        cx.notify();
+      });
+    }, cx, { hint: `path from ${cfg.base.split("/").pop()}/, optionally "as <name>"` });
+    cx.notify();
   }
 
   watch(ctx, cx) {
@@ -138,14 +257,14 @@ export default class Git extends View {
   refresh(cx, heavy) {
     if (this.refreshing) { this.again = this.again || (heavy ? "heavy" : "light"); return; }
     this.refreshing = true;
-    const loc = this.loc = location(this.fixed, this.loc), k = JSON.stringify(loc);
+    const loc = this.loc = this.where(), k = JSON.stringify(loc);
     cx.spawn(async cx => {
       try {
         if (k !== this.locKey) {
           this.locKey = k;
           this.ctx = loc.cwd ? await G.openRepo(loc.cwd, loc.on) : null;
           this.cwd = loc.cwd;
-          Object.assign(this, { status: null, op: null, branches: null, commits: null, stash: null, prs: null, main: null, mainOverride: null, sel: {}, filter: {}, copied: [] });
+          Object.assign(this, { status: null, op: null, branches: null, commits: null, stash: null, prs: null, prList: null, prsFailed: false, main: null, mainOverride: null, sel: {}, filter: {}, copied: [] });
           if (!this.ctx) return;
           this.base = await G.defaultRef(this.ctx);
           this.watch(this.ctx, cx);
@@ -161,9 +280,9 @@ export default class Git extends View {
           if (ctx !== this.ctx) return;
           Object.assign(this, { branches, commits, stash, lastHeavy: Date.now() });
         }
-        if (Date.now() - (this.prsAt ?? 0) > 120000) {
-          this.prsAt = Date.now();
-          cx.spawn(async cx => { const prs = await G.loadPRs(ctx); if (prs && ctx === this.ctx) { this.prs = prs; cx.notify(); } });
+        if (!this.prsLoading && (Date.now() - (this.prsAt ?? 0) > 120000 || (!this.prList && !this.prsFailed))) {
+          this.prsAt = Date.now(); this.prsLoading = true;
+          cx.spawn(async cx => { const r = await G.loadPRs(ctx); this.prsLoading = false; if (ctx === this.ctx) { this.prsFailed = !r; cx.notify(); } if (r && ctx === this.ctx) { this.prs = r.byBranch; this.prList = r.list; if (this.sec === "branches" && this.tab.branches === 0) this.syncMain(cx); cx.notify(); } });
         }
         this.syncMain(cx, true);
       } catch (e) { this.flash(`Refresh failed: ${e}`); }
@@ -179,13 +298,34 @@ export default class Git extends View {
   lk(sec = this.sec) { return sec === "branches" ? `branches${this.tab.branches}` : sec === "commits" ? `commits${this.tab.commits}` : sec; }
 
   rawItems(sec) {
-    if (sec === "branches") return (this.tab.branches ? this.branches?.remote : this.branches?.local) ?? [];
+    if (sec === "branches") return (this.tab.branches === 0 ? this.prList : this.tab.branches === 2 ? this.branches?.remote : this.branches?.local) ?? [];
     if (sec === "commits") return this.commits ?? [];
+    if (sec === "files") return this.changedFiles();
     return this.stash ?? [];
   }
 
+  // The files the main view's diff touches (its cards), each with where its card starts in the Code rows.
+  changedFiles() {
+    const rows = this.main?.codeRows;
+    if (!rows) return [];
+    if (this.filesOf !== rows) { this.filesOf = rows; this.files = rows.flatMap((r, i) => r.kind === "card" ? [{ ...r, at: i }] : []); }
+    return this.files;
+  }
+
+  showFile(it, cx) {
+    if (!this.main?.codeRows) return;
+    if (this.mainTab !== "code") this.setMainTab("code", cx);
+    // "top" brings an item to the nearest edge, so a file further down would land at the bottom:
+    // jump past the end first, then come back up so its card lands at the top.
+    this.mainTop = it.at;
+    this.scrolls.main.scroll_to_item(this.main.codeRows.length - 1, "top");
+    cx.notify();
+    cx.timer.after(16, cx => { this.scrolls.main.scroll_to_item(it.at, "top"); cx.notify(); });
+  }
+
   textOf(sec, it) {
-    if (sec === "branches") return `${it.name} ${it.subject}`;
+    if (sec === "files") return `${it.path} ${it.from ?? ""}`;
+    if (sec === "branches") return it.kind === "pr" ? `#${it.number} ${it.title} ${it.headRefName} ${it.author?.login ?? ""}` : `${it.name} ${it.subject}`;
     if (sec === "commits") return it.sha ? `${it.short} ${it.subject} ${it.author} ${it.refs.join(" ")}` : "";
     return it.message;
   }
@@ -219,10 +359,19 @@ export default class Git extends View {
     this.scrolls[this.lk()].scroll_to_item(i);
     this.mainOverride = null;
     this.syncMain(cx);
+    if (this.sec === "files") this.showFile(items[i], cx);
+    cx.notify();
+  }
+
+  toggleSection(id, cx) {
+    this.collapsed.has(id) ? this.collapsed.delete(id) : this.collapsed.add(id);
+    localStorage.setItem("collapsed", JSON.stringify([...this.collapsed]));
     cx.notify();
   }
 
   focusSection(id, cx) {
+    if (this.collapsed.has(id)) this.toggleSection(id, cx);
+    if (id !== "files") this.lastSec = id;
     if (this.sec !== id) { this.sec = id; this.mainOverride = null; this.mainFocus = false; this.syncMain(cx); }
     this.handle.focus();
     cx.notify();
@@ -238,13 +387,25 @@ export default class Git extends View {
 
   // ---- Main view -------------------------------------------------------------
 
+  // Files shows what another section picked, so the main view follows that section instead.
   mainSpec() {
-    const it = this.selected(), ctx = this.ctx;
+    const sec = this.sec === "files" ? this.lastSec ?? "branches" : this.sec;
+    const it = this.selected(sec), ctx = this.ctx;
     if (!it || !ctx) return null;
-    switch (this.sec) {
-      case "branches": return { key: `b:${it.name}:${it.sha}`, title: `log · ${it.name}`, commits: () => G.loadCommits(ctx, [it.name], this.base, 200) };
-      case "commits": return it.sha ? { key: `c:${it.sha}`, title: `${it.short} · ${it.subject}`, load: () => G.commitShow(ctx, it.sha) } : null;
-      case "stash": return { key: `s:${it.ref}:${it.message}`, title: `${it.ref} · ${it.message}`, load: () => G.stashShow(ctx, it.ref) };
+    switch (sec) {
+      case "branches": {
+        if (it.kind === "pr") return { key: `pr:${it.number}:${it.updatedAt}`, title: `#${it.number} · ${it.title}`, split: true, load: () => G.prShow(ctx, it.number) };
+        const base = this.base, name = it.name;
+        return { key: `b:${name}:${it.sha}:${base}`, title: base ? `${name} vs ${base}` : name, loadSplit: async () => {
+          const [log, diff] = await Promise.all([G.branchLog(ctx, name, base), G.branchDiff(ctx, name, base)]);
+          return { commitRows: commitCards(log), codeRows: fileCards(diff), commitLabel: `Commits · ${log.length}`,
+            width: Math.min(30000, Math.max(300, ...diff.slice(0, 2000).map(l => l.length * 7.3 + 40))),
+            emptyCommit: base ? `No commits on ${name} that aren't on ${base}` : "No base branch to compare with",
+            emptyCode: base ? `No code changes between ${base} and ${name}` : "No base branch to compare with" };
+        } };
+      }
+      case "commits": return it.sha ? { key: `c:${it.sha}`, title: `${it.short} · ${it.subject}`, split: true, load: () => G.commitShow(ctx, it.sha) } : null;
+      case "stash": return { key: `s:${it.ref}:${it.message}`, title: `${it.ref} · ${it.message}`, split: true, load: () => G.stashShow(ctx, it.ref) };
     }
     return null;
   }
@@ -258,6 +419,16 @@ export default class Git extends View {
     this.main = { key: spec.key, title: spec.title, style: spec.style, rows: same ? this.main.rows : null, commits: same ? this.main.commits : null, width: same ? this.main.width : 0 };
     if (!same) this.mainTop = 0;
     const token = ++this.mainToken, main = this.main;
+    if (spec.loadSplit) {
+      cx.spawn(async cx => {
+        const r = await spec.loadSplit().catch(e => ({ commitRows: [{ kind: "", text: String(e) }], codeRows: [] }));
+        if (token !== this.mainToken) return;
+        Object.assign(main, r);
+        main.rows = this.mainTab === "commit" ? main.commitRows : main.codeRows;
+        cx.notify();
+      });
+      return;
+    }
     if (spec.commits) {
       cx.spawn(async cx => {
         const commits = await spec.commits().catch(() => []);
@@ -270,8 +441,13 @@ export default class Git extends View {
     cx.spawn(async cx => {
       const lines = await spec.load().catch(e => [String(e)]);
       if (token !== this.mainToken) return;
-      main.rows = lines.map(l => lineKind(l.replace(/\t/g, "    "), spec.style));
       main.width = Math.min(30000, Math.max(300, ...lines.slice(0, 2000).map(l => l.length * 7.3 + 40)));
+      if (spec.split) {
+        const at = lines.findIndex(l => l.startsWith("diff --git"));
+        main.commitRows = (at < 0 ? lines : lines.slice(0, at)).map(l => lineKind(l.replace(/\t/g, "    "), spec.style));
+        main.codeRows = at < 0 ? [] : fileCards(lines.slice(at));
+        main.rows = this.mainTab === "commit" ? main.commitRows : main.codeRows;
+      } else main.rows = lines.map(l => lineKind(l.replace(/\t/g, "    "), spec.style));
       cx.notify();
     });
   }
@@ -289,6 +465,13 @@ export default class Git extends View {
   showOutput(entry, cx) {
     this.mainOverride = { key: `log:${entry.id}:${entry.running}`, log: entry };
     this.syncMain(cx); cx.notify();
+  }
+
+  setMainTab(tab, cx) {
+    this.mainTab = tab;
+    const m = this.main;
+    if (m?.codeRows) { m.rows = tab === "commit" ? m.commitRows : m.codeRows; this.mainTop = 0; this.scrolls.main.scroll_to_item(0, "top"); }
+    cx.notify();
   }
 
   scrollMain(delta, cx) {
@@ -618,7 +801,16 @@ export default class Git extends View {
     const sec = this.sec, it = this.selected(), A = this.customActions();
     const add = (key, label, run, extra) => A.push({ key, label, run, ...extra });
     const info = this.status?.info, head = info?.head;
-    if (sec === "branches" && it) {
+    if (sec === "files" && it) {
+      add("space", "Show in Code", cx => this.showFile(it, cx));
+      add("y", "Copy path", cx => { cx.write_to_clipboard(it.path); this.flash("Path copied"); });
+    }
+    if (sec === "branches" && it?.kind === "pr") {
+      add("space", `Check out #${it.number} (${it.headRefName})`, cx => this.cmd(`gh pr checkout ${it.number}`, `gh pr checkout ${it.number}`, cx));
+      add("o", "Open in browser", () => exec("open", [it.url]));
+      add("y", "Copy PR link", cx => { cx.write_to_clipboard(it.url); this.flash("PR link copied"); });
+      add("b", "Copy branch name", cx => { cx.write_to_clipboard(it.headRefName); this.flash("Branch name copied"); });
+    } else if (sec === "branches" && it) {
       const remote = it.kind === "remote", ref = it.name;
       if (remote) add("space", it.local ? `Check out ${it.local}` : `Check out as local ${it.short}`, cx => it.local
         ? this.cmd(`git switch ${it.local}`, `git switch ${q(it.local)}`, cx)
@@ -880,6 +1072,10 @@ export default class Git extends View {
       return true;
     }
     if (k === "?") { this.keysOpen = true; cx.notify(); return true; }
+    if (this.selectedLines().length) {
+      if (k === "cmd-c" || k === "ctrl-c") { this.copyLines(cx); return true; }
+      if (k === "escape") { this.lineSel = null; cx.notify(); return true; }
+    }
     const idx = SECTIONS.findIndex(s => s.id === this.sec);
     const num = SECTIONS.find(s => s.key === k);
     if (num) { this.focusSection(num.id, cx); return true; }
@@ -932,7 +1128,7 @@ export default class Git extends View {
   // ---- Rendering -------------------------------------------------------------
 
   render(cx) {
-    if (JSON.stringify(location(this.fixed, this.loc)) !== this.locKey && !this.refreshing) this.refresh(cx, true);
+    if (JSON.stringify(this.where()) !== this.locKey && !this.refreshing) this.refresh(cx, true);
     this.rangeSet = new Set(this.rangeRows().map(r => r.sha));
     const hasKeys = this.hadKeys = this.keyboard();
     const t = theme(), mono = settings().font_family ?? "JetBrains Mono";
@@ -941,15 +1137,21 @@ export default class Git extends View {
     const main = this.ctx ? this.mainView(t, mono) : null;
     const body = !this.ctx
       ? div().flex_1().p(14).text_color(t.dim).child(this.refreshing && !this.locKey ? "Loading…" : `Not a git repository${this.cwd ? `: ${this.cwd}` : ""}`)
-      : wide ? h_flex().flex_1().min_h(0).items_stretch().gap(6).p(6).child(sections.w(Math.max(300, Math.min(520, width * 0.42))).flex_none()).child(main.flex_1())
+      : wide ? h_flex().flex_1().min_h(0).items_stretch().p(6)
+        .child(sections.w(this.sizes.cols ?? Math.max(300, Math.min(520, width * 0.42))).flex_none().on_size_change((size) => { this.measured.cols = size.width; }))
+        .child(this.resizer("cols", "col", t)).child(main.flex_1())
         : this.mainFocus ? v_flex().flex_1().min_h(0).p(6).child(main.flex_1())
-          : v_flex().flex_1().min_h(0).gap(6).p(6).child(sections.flex_1()).child(main.h(Math.max(160, (this.size?.height ?? 600) * 0.38)).flex_none());
+          : v_flex().flex_1().min_h(0).p(6).child(sections.flex_1()).child(this.resizer("main", "row", t))
+            .child(main.h(this.sizes.main ?? Math.max(160, (this.size?.height ?? 600) * 0.38)).flex_none().on_size_change((size) => { this.measured.main = size.height; }));
     return v_flex().id("git").relative().size_full().min_h(0).rounded(pane ? 0 : 10).overflow_hidden().bg(t.background).when(!pane, el => el.border_1().border_color(hasKeys ? t.accent : t.border))
       .text_color(t.foreground).text_size(12.5)
       .track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .on_mouse_down("left", () => { if (!this.prompt) this.handle.focus(); })
       .on_size_change((size, cx) => { this.size = size; cx.notify(); })
+      .on_mouse_move((e, cx) => this.dragTo(e, cx))
+      .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
       .child(this.header(t, pane))
+      .when(!pane && Boolean(this.repoCfg?.repos.length), el => el.child(this.repoBar(t)))
       .when(Boolean(this.op), el => el.child(this.opBanner(t)))
       .when(Boolean(this.ai), el => el.child(this.aiBanner(t)))
       .child(body)
@@ -1084,14 +1286,51 @@ export default class Git extends View {
   }
 
   sectionsColumn(t, mono, wide) {
-    return v_flex().min_h(0).gap(6).children(SECTIONS.map(s => this.sectionBox(s, t, mono)));
+    return v_flex().min_h(0).children(SECTIONS.filter(s => s.id !== "files" || this.main?.codeRows).flatMap(s => this.collapsed.has(s.id) ? [this.sectionBox(s, t, mono), div().h(6).flex_none()] : [this.sectionBox(s, t, mono), this.resizer(`h:${s.id}`, "row", t)]));
+  }
+
+  // A 6px strip that resizes by dragging; a double click puts it back to automatic.
+  resizer(key, dir, t) {
+    const row = dir === "row";
+    return div().id(`resize-${key}`).flex_none().when(row, el => el.h(6).w_full().cursor_row_resize()).when(!row, el => el.w(6).h_full().cursor_col_resize())
+      .flex().items_center().justify_center()
+      .child(div().rounded(1).when(row, el => el.h(2).w(28)).when(!row, el => el.w(2).h(28))
+        .when(this.drag?.key === key, el => el.bg(t.accent)).hover(s => s.bg(t.border)))
+      .on_mouse_down("left", (e, cx) => {
+        cx.stop_propagation();
+        if (e.click_count >= 2) { delete this.sizes[key]; localStorage.setItem("sizes", JSON.stringify(this.sizes)); this.drag = null; cx.notify(); return; }
+        this.drag = { key, row, from: row ? e.position.y : e.position.x, start: this.sizes[key] ?? this.measured[key] ?? 120 };
+        cx.notify();
+      });
+  }
+
+  dragTo(e, cx) {
+    const d = this.drag;
+    if (!d) return;
+    const delta = (d.row ? e.position.y : e.position.x) - d.from;
+    // The main view sits below its handle (narrow), so dragging down shrinks it.
+    const size = d.start + (d.key === "main" ? -delta : delta);
+    this.sizes[d.key] = Math.round(Math.max(d.key === "cols" ? 240 : 54, Math.min(size, 4000)));
+    cx.notify();
+  }
+
+  endDrag(cx) {
+    if (!this.drag) return;
+    this.drag = null;
+    localStorage.setItem("sizes", JSON.stringify(this.sizes));
+    cx.notify();
   }
 
   sectionBox(s, t, mono) {
-    const focusedSec = this.sec === s.id, lk = this.lk(s.id), items = this.items(s.id), sel = this.selIndex(s.id);
+    const shut = this.collapsed.has(s.id);
+    const focusedSec = this.sec === s.id, lk = this.lk(s.id), items = this.items(s.id), sel = this.selIndex(s.id), fixed = shut ? null : this.sizes[`h:${s.id}`];
     const count = s.id === "commits" ? items.filter(r => r.sha).length : items.length;
-    const head = h_flex().id(`sec-${s.id}`).h(24).flex_none().px(8).gap(6).items_center().cursor_pointer()
+    const head = h_flex().id(`sec-${s.id}`).h(24).flex_none().pl(4).pr(8).gap(6).items_center().cursor_pointer()
       .on_click((_e, cx) => this.focusSection(s.id, cx))
+      .child(div().id(`fold-${s.id}`).size(16).flex_none().flex().items_center().justify_center().rounded(4).text_color(t.dim)
+        .hover(st => st.bg(t.hover).text_color(t.foreground)).tooltip(shut ? `Show ${s.title}` : `Hide ${s.title}`)
+        .on_click((_e, cx) => { cx.stop_propagation(); this.toggleSection(s.id, cx); })
+        .child(svg(`${CHROME}/chevron-${shut ? "right" : "down"}.svg`).size(11)))
       .child(div().text_size(10.5).font_semibold().px(4).rounded(4).bg(focusedSec && this.hadKeys ? t.accent : t.raised).text_color(focusedSec && this.hadKeys ? t.accent_foreground : t.muted).child(s.key))
       .child(div().font_semibold().text_color(focusedSec ? t.foreground : t.muted).child(s.title))
       .when(Boolean(s.tabs), el => el.children(s.tabs.map((name, i) => div().id(`tab-${s.id}-${i}`).px(5).rounded(4).text_size(11)
@@ -1101,6 +1340,7 @@ export default class Git extends View {
       .child(div().flex_1())
       .child(div().text_size(11).text_color(t.dim).child(String(count)));
     const row = (it, i, inList) => this.row(s.id, it, i, i === sel, focusedSec, t, mono, inList);
+    if (shut) return v_flex().id(`box-${s.id}`).flex_none().rounded(8).border_1().border_color(focusedSec && this.hadKeys ? t.accent : t.border).child(head);
     let body;
     if (!items.length) body = div().px(10).h(ROW).flex_none().flex().items_center().text_size(11.5).text_color(t.dim).child(this.emptyText(s.id));
     else if (focusedSec) {
@@ -1111,20 +1351,26 @@ export default class Git extends View {
           .on_item_click((key, cx) => this.clickRow(s.id, items.findIndex((it, j) => this.itemKey(s.id, it, j) === key), cx))))
         .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0());
     } else {
-      const cap = Math.min(s.cap, items.length), start = Math.max(0, Math.min(sel - Math.floor(cap / 2), items.length - cap));
+      const fit = fixed ? Math.max(1, Math.floor((fixed - 30) / ROW)) : s.cap;
+      const cap = Math.min(fit, items.length), start = Math.max(0, Math.min(sel - Math.floor(cap / 2), items.length - cap));
       body = v_flex().flex_none().children(items.slice(start, start + cap).map((it, j) => row(it, start + j)));
     }
     return v_flex().id(`box-${s.id}`).min_h(0).rounded(8).border_1().border_color(focusedSec && this.hadKeys ? t.accent : t.border).pb(4)
-      .when(focusedSec, el => el.flex_1()).when(!focusedSec, el => el.flex_none())
+      .when(Boolean(fixed), el => el.h(fixed).flex_none().overflow_hidden())
+      .when(!fixed && focusedSec, el => el.flex_1()).when(!fixed && !focusedSec, el => el.flex_none())
+      .on_size_change((size) => { this.measured[`h:${s.id}`] = size.height; })
       .child(head).child(body);
   }
 
   emptyText(sec) {
+    if (sec === "files") return this.main?.codeRows ? "No changed files" : "Pick a PR, branch or commit to see its files";
+    if (sec === "branches" && this.tab.branches === 0) return this.prList ? "No pull requests" : this.prsFailed ? "Couldn't list pull requests (is gh installed and logged in?)" : "Loading pull requests…";
     return { branches: "No branches", commits: "No commits", stash: "No stashes" }[sec];
   }
 
   itemKey(sec, it, i) {
-    return sec === "branches" ? `b${it.name}` : sec === "commits" ? it.sha : `s${it.ref}`;
+    if (sec === "files") return `f${it.path}`;
+    return sec === "branches" ? (it.kind === "pr" ? `p${it.number}` : `b${it.name}`) : sec === "commits" ? it.sha : `s${it.ref}`;
   }
 
   // Virtual-list rows can't carry handlers, so a second click on the same row within 400 ms counts as a double click.
@@ -1145,8 +1391,9 @@ export default class Git extends View {
       .when(selected || picked, e => e.bg(focusedSec ? t.selected : t.hover))
       .hover(s => s.bg(selected && focusedSec ? t.selected : t.hover))
       .when(!inList, e => e.on_click((_e, cx) => this.clickRow(sec, i, cx)));
-    if (sec === "branches") return this.branchRow(el, it, t);
+    if (sec === "branches") return it.kind === "pr" ? this.prRow(el, it, t) : this.branchRow(el, it, t);
     if (sec === "commits") return this.commitRow(el, it, t, mono);
+    if (sec === "files") return this.fileRow(el, it, t);
     return el.child(div().flex_none().text_color(t.dim).font_family(mono).text_size(11.5).child(it.ref.replace("stash@", "")))
       .child(div().flex_1().min_w(0).truncate().child(it.message)).child(div().flex_none().text_size(11).text_color(t.dim).child(it.date));
   }
@@ -1169,6 +1416,32 @@ export default class Git extends View {
       .when((this.size?.width ?? 0) >= 520, e => e.child(div().flex_none().text_size(11).text_color(t.dim).child(b.date.replace(/ ago$/, ""))));
   }
 
+  fileRow(el, f, t) {
+    const [mark, color] = f.status === "new" ? ["A", t.ansi2] : f.status === "deleted" ? ["D", t.ansi1] : f.from ? ["R", t.ansi4] : ["M", t.ansi3];
+    const slash = f.path.lastIndexOf("/"), dir = slash >= 0 ? f.path.slice(0, slash + 1) : "", base = f.path.slice(slash + 1);
+    return el.child(div().w(12).flex_none().text_size(11).font_semibold().text_color(color).child(mark))
+      .child(h_flex().flex_1().min_w(0).overflow_hidden()
+        .child(div().flex_none().text_color(t.foreground).child(base))
+        .when(Boolean(dir), e => e.child(div().min_w(0).pl(6).truncate().text_size(11).text_color(t.dim).child(dir))))
+      .when(f.add > 0, e => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child(`+${f.add}`)))
+      .when(f.del > 0, e => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
+  }
+
+  prRow(el, pr, t) {
+    const draft = pr.isDraft && pr.state === "OPEN", done = pr.state !== "OPEN";
+    const badge = (text, color) => div().flex_none().px(4).rounded(4).border_1().border_color(color).text_size(10.5).text_color(color).child(text);
+    const review = { APPROVED: ["✓", t.ansi2, "Approved"], CHANGES_REQUESTED: ["✗", t.ansi1, "Changes requested"] }[pr.reviewDecision];
+    const days = (Date.now() - new Date(pr.updatedAt).getTime()) / 86400000;
+    const age = !Number.isFinite(days) ? "" : days < 1 / 24 ? `${Math.max(1, Math.round(days * 1440))}m` : days < 1 ? `${Math.round(days * 24)}h` : `${Math.round(days)}d`;
+    const wide = (this.size?.width ?? 0) >= 520;
+    return el.child(div().w(42).flex_none().text_size(11.5).text_color(t.dim).child(`#${pr.number}`))
+      .child(div().flex_1().min_w(0).truncate().text_color(done ? t.dim : t.foreground).child(pr.title))
+      .when(wide && Boolean(pr.author?.login), e => e.child(div().flex_none().text_size(11).text_color(t.dim).child(pr.author.login)))
+      .when(Boolean(review), e => e.child(div().id(`pr-review-${pr.number}`).flex_none().text_size(11.5).text_color(review[1]).tooltip(review[2]).child(review[0])))
+      .child(badge(draft ? "draft" : pr.state.toLowerCase(), draft ? t.dim : t[PR_COLOR[pr.state]] ?? t.dim))
+      .when(wide && Boolean(age), e => e.child(div().flex_none().text_size(11).text_color(t.dim).child(age)));
+  }
+
   palette(t) { return [t.ansi4, t.ansi5, t.ansi6, t.ansi2, t.ansi3, t.ansi1, t.ansi12 ?? t.ansi4, t.ansi13 ?? t.ansi5]; }
 
   commitRow(el, c, t, mono) {
@@ -1185,16 +1458,72 @@ export default class Git extends View {
       .when((this.size?.width ?? 0) >= 520, e => e.child(div().flex_none().text_size(11).text_color(t.dim).child(`${c.author.split(" ")[0]} · ${c.date.replace(/ ago$/, "")}`)));
   }
 
+  // Code rows picked by click / shift-click in the Code view, as [first, last] indices, or [].
+  selectedLines() {
+    const m = this.main, sel = this.lineSel;
+    if (!sel || !m?.codeRows || m.rows !== m.codeRows || sel.key !== m.key) return [];
+    return [Math.min(sel.a, sel.b), Math.max(sel.a, sel.b)];
+  }
+
+  clickLine(i, cx) {
+    const m = this.main, r = m?.rows?.[i];
+    if (!r || m.rows !== m.codeRows) return;
+    if (r.kind === "card") { cx.write_to_clipboard(r.path); this.flash(`Copied ${r.path}`); cx.notify(); return; }
+    if (r.kind === "gap") return;
+    const [lo, hi] = this.selectedLines();
+    if (this.shiftPress && lo != null) this.lineSel = { ...this.lineSel, b: i };
+    else this.lineSel = lo === i && hi === i ? null : { key: m.key, a: i, b: i };
+    cx.notify();
+  }
+
+  // As a file:lines header and a diff block per file, ready to paste into an agent.
+  copyLines(cx) {
+    const [lo, hi] = this.selectedLines(), rows = this.main.codeRows;
+    if (lo == null) return;
+    let card = null;
+    for (let i = lo; i >= 0; i--) if (rows[i].kind === "card") { card = rows[i]; break; }
+    const groups = [];
+    for (let i = lo; i <= hi; i++) {
+      const r = rows[i];
+      if (r.kind === "card") { card = r; continue; }
+      if (!r.inCard) continue;
+      if (groups.at(-1)?.card !== card) groups.push({ card, rows: [] });
+      groups.at(-1).rows.push(r);
+    }
+    const text = groups.map(g => {
+      const nums = g.rows.map(r => r.new ?? r.old).filter(n => n != null);
+      const span = nums.length ? (Math.min(...nums) === Math.max(...nums) ? `:${nums[0]}` : `:${Math.min(...nums)}-${Math.max(...nums)}`) : "";
+      return `${g.card?.path ?? ""}${span}\n\`\`\`diff\n${g.rows.map(r => r.text).join("\n")}\n\`\`\``;
+    }).join("\n\n");
+    cx.write_to_clipboard(text);
+    const n = groups.reduce((sum, g) => sum + g.rows.length, 0);
+    this.flash(`Copied ${n} line${n === 1 ? "" : "s"}`);
+    cx.notify();
+  }
+
   mainView(t, mono) {
     const m = this.main, log = m?.log;
-    const head = h_flex().h(28).flex_none().px(10).gap(8).items_center().border_b(1).border_color(t.border)
+    let head = h_flex().h(28).flex_none().px(10).gap(8).items_center().border_b(1).border_color(t.border)
       .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(this.mainFocus ? t.foreground : t.muted)
         .child(log ? `${log.running ? "running" : log.code === 0 ? "✓" : `✗ exit ${log.code}`} · ${log.title}` : m?.title ?? ""))
+      .when(this.selectedLines().length > 0, el => {
+        const [lo, hi] = this.selectedLines(), n = m.codeRows.slice(lo, hi + 1).filter(r => r.inCard).length;
+        return el.child(div().flex_none().text_size(11).text_color(t.accent).child(`${n} line${n === 1 ? "" : "s"} selected`))
+          .child(this.iconButton("main-copy-lines", "mods/git/copy.svg", cx => this.copyLines(cx), t, "Copy"))
+          .child(this.iconButton("main-clear-lines", `${CHROME}/x.svg`, cx => { this.lineSel = null; cx.notify(); }, t));
+      })
       .when(Boolean(log), el => el
         .when(Boolean(log.running && log.addr), e => e.child(this.iconButton("main-peek", `${CHROME}/terminal.svg`, () => run("terminal.peek", { terminal: log.addr }), t, "Watch")))
         .child(this.iconButton("main-copy", "mods/git/copy.svg", cx => { cx.write_to_clipboard(`$ ${log.title}\n${log.output}`); this.flash("Output copied"); }, t, "Copy"))
         .when(!log.running && log.code !== 0, e => e.child(this.iconButton("main-ai", "mods/git/ai.svg", cx => this.askAI(cx), t, "Ask AI"))));
-    const box = v_flex().min_h(0).min_w(0).rounded(8).border_1().border_color(this.mainFocus && this.hadKeys ? t.accent : t.border).overflow_hidden().child(head);
+    const tabs = m?.codeRows ? h_flex().flex_none().gap(6).p(6).border_b(1).border_color(t.border).children([["commit", m.commitLabel ?? "Commit"], ["code", `Code${m.codeRows.length ? ` · ${m.codeRows.filter(r => r.kind === "card").length} files` : ""}`]].map(([id, label]) => {
+      const on = (this.mainTab ?? "code") === id;
+      return h_flex().id(`main-tab-${id}`).flex_1().h(30).items_center().justify_center().rounded(6).border_1().text_size(12.5).cursor_pointer()
+        .border_color(on ? t.accent : t.border).bg(on ? t.raised : t.background).text_color(on ? t.foreground : t.muted)
+        .when(on, e => e.font_semibold()).hover(s => s.bg(t.hover).text_color(t.foreground))
+        .on_click((_e, cx) => { cx.stop_propagation(); this.setMainTab(id, cx); }).child(label);
+    })) : null;
+    const box = v_flex().min_h(0).min_w(0).rounded(8).border_1().border_color(this.mainFocus && this.hadKeys ? t.accent : t.border).overflow_hidden().child(head).when(Boolean(tabs), el => el.child(tabs));
     if (!m) return box.child(div().p(10).text_color(t.dim).child("Nothing selected"));
     if (log) return box.child(div().id("main-editor").flex_1().min_h(0).on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Editor.new(this.editor).size_full()));
     if (!m.rows) return box.child(div().p(10).text_color(t.dim).child("Loading…"));
@@ -1204,14 +1533,36 @@ export default class Git extends View {
         .track_scroll(this.scrolls.main).size_full())
       .child(Scrollbar.vertical("main-commits").viewport_from_layout().absolute().inset_0()));
     const palette = { add: [t.ansi2, t.ansi2 + "18"], del: [t.ansi1, t.ansi1 + "18"], hunk: [t.ansi6, t.raised], file: [t.foreground, null], meta: [t.ansi3, null] };
-    const line = r => {
+    const cardSide = el => el.mx(8).border_l(1).border_r(1).border_color(t.border);
+    const coded = m.rows === m.codeRows, [selLo, selHi] = this.selectedLines();
+    const gutter = n => div().w(36).flex_none().pr(6).text_right().text_color(t.dim).child(n == null ? "" : String(n));
+    const line = (r, i) => {
+      if (r.kind === "gap") return div().h(LINE).flex_none();
+      if (r.kind === "card") {
+        const one = r.last === r;
+        return cardSide(h_flex().h(LINE).flex_none().px(10).gap(8).items_center().whitespace_nowrap().bg(t.raised).border_t(1).rounded_t(6))
+          .when(one, e => e.border_b(1).rounded_b(6)).font_semibold()
+          .child(div().text_color(t.foreground).child(r.from ? `${r.from} → ${r.path}` : r.path))
+          .when(Boolean(r.status), e => e.child(div().text_size(10.5).text_color(r.status === "new" ? t.ansi2 : t.ansi1).child(r.status)))
+          .when(r.add > 0, e => e.child(div().text_color(t.ansi2).child(`+${r.add}`)))
+          .when(r.del > 0, e => e.child(div().text_color(t.ansi1).child(`-${r.del}`)))
+          .child(svg("mods/git/copy.svg").size(11).flex_none().text_color(t.dim));
+      }
       const [fg, bg] = palette[r.kind] ?? [t.foreground, null];
-      return div().h(LINE).flex_none().px(10).whitespace_nowrap().text_color(fg).when(Boolean(bg), e => e.bg(bg)).when(r.kind === "file", e => e.font_semibold()).child(r.text || " ");
+      const picked = coded && selLo != null && i >= selLo && i <= selHi && r.inCard;
+      const el = coded && r.inCard
+        ? h_flex().h(LINE).flex_none().pr(10).whitespace_nowrap().text_color(fg).when(Boolean(bg), e => e.bg(bg)).when(picked, e => e.bg(t.selected))
+          .child(gutter(r.old)).child(gutter(r.new)).child(div().pl(6).child(r.text || " "))
+        : div().h(LINE).flex_none().px(10).whitespace_nowrap().text_color(fg).when(Boolean(bg), e => e.bg(bg)).when(r.kind === "file", e => e.font_semibold()).child(r.text || " ");
+      return r.inCard ? cardSide(el).when(Boolean(r.last), e => e.border_b(1).rounded_b(6)) : el;
     };
+    if (m.codeRows && !m.rows.length) return box.child(div().p(10).text_color(t.dim).child(m.rows === m.codeRows ? m.emptyCode ?? "No code changes in this commit" : m.emptyCommit ?? "Nothing to show"));
     return box.child(div().flex_1().min_h(0).relative().font_family(mono).text_size(12)
       .child(div().id("main-x").size_full().overflow_x_scrollbar()
-        .child(div().w_full().min_w(m.width).h_full().child(v_virtual_list("main-lines", m.rows.length, LINE, i => String(i),
-          range => m.rows.slice(range.start, range.end).map(line)).track_scroll(this.scrolls.main).size_full())))
+        .on_mouse_down("left", e => { this.shiftPress = Boolean(e.modifiers?.shift); })
+        .child(div().w_full().min_w(m.width + (coded ? 84 : 0)).h_full().child(v_virtual_list("main-lines", m.rows.length, LINE, i => String(i),
+          range => m.rows.slice(range.start, range.end).map((r, j) => line(r, range.start + j))).track_scroll(this.scrolls.main).size_full()
+          .on_item_click((key, cx) => this.clickLine(Number(key), cx)))))
       .child(Scrollbar.vertical("main-lines").viewport_from_layout().absolute().inset_0()));
   }
 

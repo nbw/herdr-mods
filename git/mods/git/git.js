@@ -123,16 +123,37 @@ export async function loadStash(ctx) {
 }
 
 export async function loadPRs(ctx) {
-  const r = await exec("gh", ["pr", "list", "--state", "all", "--limit", "200", "--json", "number,headRefName,state,isDraft,url,title"], { cwd: ctx.root, on: ctx.on }).catch(() => null);
+  const r = await exec("gh", ["pr", "list", "--state", "all", "--limit", "200", "--json", "number,headRefName,state,isDraft,url,title,author,updatedAt,reviewDecision"], { cwd: ctx.root, on: ctx.on }).catch(() => null);
   if (r?.code !== 0) return null;
-  const map = {};
-  try { for (const pr of JSON.parse(r.stdout)) if (!map[pr.headRefName]) map[pr.headRefName] = pr; } catch { return null; }
-  return map;
+  let list;
+  try { list = JSON.parse(r.stdout); } catch { return null; }
+  const byBranch = {};
+  for (const pr of list) if (!byBranch[pr.headRefName]) byBranch[pr.headRefName] = pr;
+  const order = { OPEN: 0, MERGED: 1, CLOSED: 2 };
+  list = list.map(pr => ({ ...pr, kind: "pr" }))
+    .sort((a, b) => (order[a.state] ?? 3) - (order[b.state] ?? 3) || String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  return { byBranch, list };
+}
+
+// A PR as `gh pr view` prints it, then its diff (the main view splits them at "diff --git").
+export async function prShow(ctx, number) {
+  const run = args => exec("gh", args, { cwd: ctx.root, on: ctx.on }).then(r => r.code === 0 ? r.stdout : r.stderr || "").catch(e => String(e));
+  const [view, diff] = await Promise.all([run(["pr", "view", String(number)]), run(["pr", "diff", String(number)])]);
+  return clip(`${view.replace(/\n$/, "")}\n${diff}`);
 }
 
 const clip = text => { const lines = text.replace(/\n$/, "").split("\n"); return lines.length > 4000 ? [...lines.slice(0, 4000), "… (truncated)"] : lines; };
 
 export const commitShow = async (ctx, sha) => clip(await out(ctx, ["show", "--stat", "--patch", "--format=fuller", "--no-color", sha]));
+// A branch against the base, as a PR shows it: its own commits (newest first) and the diff from the merge base.
+export async function branchLog(ctx, branch, base) {
+  const raw = await out(ctx, ["log", "--format=%h%x1f%an%x1f%ar%x1f%s%x1f%b%x1e", "-n", "200", branch, ...(base ? ["--not", base] : [])]);
+  return raw.split("\x1e").map(r => r.replace(/^\n/, "")).filter(Boolean).map(r => {
+    const [short, author, date, subject, body] = r.split(US);
+    return { short, author, date, subject, body: (body ?? "").replace(/\s+$/, "") };
+  });
+}
+export const branchDiff = async (ctx, branch, base) => base ? clip(await out(ctx, ["diff", "--no-color", `${base}...${branch}`])).filter(Boolean) : [];
 export const stashShow = async (ctx, ref) => clip(await out(ctx, ["stash", "show", "--stat", "--patch", "--include-untracked", "--no-color", ref]));
 
 // Runs a shell script in a background core terminal through the login shell (so hooks
